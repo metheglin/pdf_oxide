@@ -127,6 +127,11 @@ pub struct RenderOptions {
     /// one of these entries, all graphical content within that marked content
     /// scope is suppressed (not painted). Empty means render everything.
     pub excluded_layers: HashSet<String>,
+    /// pdf_dioxide fix #1309 (opt-in, default `false`): resolve a Form
+    /// XObject's indirect `/Resources` before loading its fonts, so text
+    /// inside such Forms is drawn. Upstream issue:
+    /// https://github.com/yfedoseev/pdf_oxide/issues/1309
+    pub resolve_form_resources: bool,
     /// Explicit float scale factor set by `render_page_fit`.
     /// When `Some`, bypasses integer-DPI quantization so fit dimensions are
     /// exact (issue #480). Not part of the public API; set via
@@ -143,6 +148,7 @@ impl Default for RenderOptions {
             render_annotations: true,
             jpeg_quality: 85,
             excluded_layers: HashSet::new(),
+            resolve_form_resources: false,
             scale_override: None,
         }
     }
@@ -4104,8 +4110,23 @@ impl PageRenderer {
                                         };
 
                                         // Form XObjects can have their own Resources dictionary.
-                                        let form_resources =
-                                            dict.get("Resources").unwrap_or(resources);
+                                        //
+                                        // pdf_dioxide fix #1309 (opt-in): when /Resources is an
+                                        // indirect reference, `load_resources` below sees
+                                        // `Object::Reference`, loads no fonts, and the Form's text
+                                        // is dropped. Resolve it first when
+                                        // `RenderOptions::resolve_form_resources` is set; the
+                                        // default path stays byte-identical to upstream.
+                                        let form_resources_owned: Object =
+                                            if self.options.resolve_form_resources {
+                                                match dict.get("Resources") {
+                                                    Some(r) => doc.resolve_object(r)?,
+                                                    None => resources.clone(),
+                                                }
+                                            } else {
+                                                dict.get("Resources").unwrap_or(resources).clone()
+                                            };
+                                        let form_resources = &form_resources_owned;
 
                                         // Save current fonts and load form-specific fonts
                                         let old_fonts = self.fonts.clone();
