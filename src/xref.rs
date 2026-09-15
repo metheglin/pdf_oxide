@@ -592,8 +592,11 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
         let trimmed = lines[line_idx].trim();
         line_idx += 1;
 
-        // End of xref table
+        // End of xref table. Back up onto the `trailer` line: the dictionary may
+        // live on that same line (`trailer<</Size 5>>`), and skipping it would
+        // discard the dict entirely.
         if trimmed.starts_with("trailer") {
+            line_idx -= 1;
             break;
         }
 
@@ -713,14 +716,16 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
     // trailer entries are available via xref.trailer().
     let remaining_text: String = lines[line_idx..].join("\n");
     if !remaining_text.trim().is_empty() {
-        // The trailer dict should start with "<<" after optional whitespace
+        // The trailer dict should start with "<<" after optional whitespace.
+        // ISO 32000-1 7.5.5 does not require whitespace between the `trailer`
+        // keyword and its dictionary: `<<` is a delimiter, so `trailer<</Size 5>>`
+        // is well-formed, and it is what linearized writers commonly emit. Strip
+        // the keyword when it is glued to the dict, otherwise /Prev is silently
+        // lost and every earlier xref section goes unmerged.
         let trimmed = remaining_text.trim();
-        if trimmed.starts_with("<<")
-            || trimmed.starts_with("<< ")
-            || trimmed.starts_with("<<\n")
-            || trimmed.starts_with("<<\r")
-        {
-            if let Ok((_, trailer_obj)) = parse_object(trimmed.as_bytes()) {
+        let dict_text = trimmed.strip_prefix("trailer").map_or(trimmed, str::trim_start);
+        if dict_text.starts_with("<<") {
+            if let Ok((_, trailer_obj)) = parse_object(dict_text.as_bytes()) {
                 if let Some(dict) = trailer_obj.as_dict() {
                     xref.set_trailer(dict.clone());
                 }
