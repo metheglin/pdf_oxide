@@ -24368,6 +24368,13 @@ impl PdfDocument {
                     &xobject
                 };
 
+                // A stencil mask (/ImageMask true) has no /ColorSpace, so the
+                // extractor rejects it; list it as the one-bit gray image of
+                // its samples instead of leaving the page with no images.
+                let stencil_view =
+                    crate::extractors::images::stencil_mask_as_gray_image(xobject_for_extract);
+                let xobject_for_extract = stencil_view.as_ref().unwrap_or(xobject_for_extract);
+
                 // Extract as Image XObject
                 if let Ok(mut image) = extract_image_from_xobject(
                     Some(self),
@@ -24632,6 +24639,9 @@ impl PdfDocument {
             dict: expanded_dict,
             data: bytes::Bytes::copy_from_slice(data),
         };
+        // An inline stencil mask (`BI /IM true`) lists like an XObject one.
+        let stream_obj = crate::extractors::images::stencil_mask_as_gray_image(&stream_obj)
+            .unwrap_or(stream_obj);
 
         // Use existing extraction logic
         let mut image =

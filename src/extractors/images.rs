@@ -921,6 +921,42 @@ fn samples_to_decoded_bytes(
     Some(out)
 }
 
+
+/// View a stencil mask (`/ImageMask true`) as the one-bit DeviceGray image of
+/// its samples, for listing a page's images.
+///
+/// A stencil mask has no `/ColorSpace` and is one bit per component
+/// (ISO 32000-1 §8.9.6.2, Table 89), so [`extract_image_from_xobject`] rejects
+/// it for the missing entry and a page whose content is a single full-page
+/// stencil (the usual output of scanner software) listed no images at all.
+/// Read as 1-bit DeviceGray, a painted sample comes out black under either
+/// `/Decode`: `[0 1]` paints sample 0, which DeviceGray maps to black, and
+/// `[1 0]` paints sample 1, which the reversed decode maps to black.
+///
+/// Returns `None` for anything that is not a stencil mask. The renderer does
+/// not call this: it keeps reading the stream as a stencil.
+pub(crate) fn stencil_mask_as_gray_image(
+    xobject: &crate::object::Object,
+) -> Option<crate::object::Object> {
+    use crate::object::Object;
+    let Object::Stream { dict, data } = xobject else {
+        return None;
+    };
+    if !matches!(dict.get("ImageMask"), Some(Object::Boolean(true)))
+        || dict.contains_key("ColorSpace")
+    {
+        return None;
+    }
+    let mut dict = dict.clone();
+    dict.remove("ImageMask");
+    dict.insert("ColorSpace".to_string(), Object::Name("DeviceGray".to_string()));
+    dict.insert("BitsPerComponent".to_string(), Object::Integer(1));
+    Some(Object::Stream {
+        dict,
+        data: data.clone(),
+    })
+}
+
 /// Extract an image from an XObject stream.
 pub fn extract_image_from_xobject(
     doc: Option<&crate::document::PdfDocument>,
@@ -4405,5 +4441,144 @@ mod one_element_device_color_space_tests {
             let obj = Object::Array(vec![Object::Name(name.to_string())]);
             assert_eq!(parse_color_space(&obj).unwrap(), expected, "[/{name}]");
         }
+    }
+}
+
+#[cfg(test)]
+mod stencil_mask_listing_tests {
+    use super::*;
+    use crate::object::Object;
+    use std::collections::HashMap;
+
+    const SIZE: i64 = 16;
+
+    /// 16x16, left half sample 0 and right half sample 1, packed MSB first.
+    fn left_zero_right_one() -> Vec<u8> {
+        [0x00u8, 0xFF].repeat(SIZE as usize)
+    }
+
+    /// The same picture (left half black) as CCITT Group 4, written by hand:
+    /// row 1 in horizontal mode (white run 0, black run 8) then V0, rows
+    /// 2..16 as three V0 codes each, then EOFB.
+    fn left_black_g4() -> Vec<u8> {
+        let mut bits = String::from("001") + "00110101" + "000101" + "1";
+        bits += &"111".repeat(SIZE as usize - 1);
+        bits += &"000000000001".repeat(2);
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        bits.as_bytes()
+            .chunks(8)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
+            .collect()
+    }
+
+    fn image_dict() -> HashMap<String, Object> {
+        let mut dict = HashMap::new();
+        dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
+        dict.insert("Width".to_string(), Object::Integer(SIZE));
+        dict.insert("Height".to_string(), Object::Integer(SIZE));
+        dict.insert("BitsPerComponent".to_string(), Object::Integer(1));
+        dict
+    }
+
+    fn with_g4(mut dict: HashMap<String, Object>, black_is_1: bool) -> Object {
+        let mut parms = HashMap::new();
+        parms.insert("K".to_string(), Object::Integer(-1));
+        parms.insert("Columns".to_string(), Object::Integer(SIZE));
+        parms.insert("Rows".to_string(), Object::Integer(SIZE));
+        if black_is_1 {
+            parms.insert("BlackIs1".to_string(), Object::Boolean(true));
+        }
+        dict.insert("Filter".to_string(), Object::Name("CCITTFaxDecode".to_string()));
+        dict.insert("DecodeParms".to_string(), Object::Dictionary(parms));
+        Object::Stream {
+            dict,
+            data: bytes::Bytes::from(left_black_g4()),
+        }
+    }
+
+    /// Mean luma of the left and right halves of the decoded image.
+    fn half_means(xobject: &Object) -> (u32, u32) {
+        let img = extract_image_from_xobject(None, xobject, None, None)
+            .expect("image extracts")
+            .to_dynamic_image()
+            .expect("image decodes")
+            .to_luma8();
+        assert_eq!((img.width(), img.height()), (SIZE as u32, SIZE as u32));
+        let half = SIZE as u32 / 2;
+        let mean = |x0: u32| {
+            let mut sum = 0u32;
+            for y in 0..img.height() {
+                for x in x0..x0 + half {
+                    sum += img.get_pixel(x, y).0[0] as u32;
+                }
+            }
+            sum / (half * img.height())
+        };
+        (mean(0), mean(half))
+    }
+
+    fn stencil(decode: Option<[i64; 2]>) -> Object {
+        let mut dict = image_dict();
+        dict.insert("ImageMask".to_string(), Object::Boolean(true));
+        if let Some([lo, hi]) = decode {
+            dict.insert(
+                "Decode".to_string(),
+                Object::Array(vec![Object::Integer(lo), Object::Integer(hi)]),
+            );
+        }
+        Object::Stream {
+            dict,
+            data: bytes::Bytes::from(left_zero_right_one()),
+        }
+    }
+
+    #[test]
+    fn a_stencil_mask_is_rejected_by_the_extractor_itself() {
+        // The renderer relies on this: it reads /ImageMask streams as
+        // stencils, not through the image extractor.
+        assert!(extract_image_from_xobject(None, &stencil(None), None, None).is_err());
+    }
+
+    #[test]
+    fn a_stencil_mask_lists_as_a_one_bit_gray_image_black_where_it_paints() {
+        // Default /Decode [0 1]: sample 0 is painted, so the left half is black.
+        let view = stencil_mask_as_gray_image(&stencil(None)).expect("a stencil converts");
+        assert_eq!(half_means(&view), (0, 255));
+    }
+
+    #[test]
+    fn a_stencil_mask_under_a_reversed_decode_is_black_where_it_paints() {
+        // /Decode [1 0]: sample 1 is painted, so the right half is black.
+        let view = stencil_mask_as_gray_image(&stencil(Some([1, 0]))).expect("a stencil converts");
+        assert_eq!(half_means(&view), (255, 0));
+    }
+
+    #[test]
+    fn a_fax_coded_stencil_mask_lists_black_where_it_paints() {
+        let mut dict = image_dict();
+        dict.insert("ImageMask".to_string(), Object::Boolean(true));
+        let view = stencil_mask_as_gray_image(&with_g4(dict, false)).expect("a stencil converts");
+        assert_eq!(half_means(&view), (0, 255));
+    }
+
+    #[test]
+    fn an_ordinary_image_is_not_taken_for_a_stencil() {
+        let mut dict = image_dict();
+        dict.insert("ColorSpace".to_string(), Object::Name("DeviceGray".to_string()));
+        let gray = Object::Stream {
+            dict,
+            data: bytes::Bytes::from(left_zero_right_one()),
+        };
+        assert!(stencil_mask_as_gray_image(&gray).is_none());
+        assert!(stencil_mask_as_gray_image(&Object::Null).is_none());
+    }
+
+    #[test]
+    fn a_group4_gray_image_is_unchanged() {
+        let mut dict = image_dict();
+        dict.insert("ColorSpace".to_string(), Object::Name("DeviceGray".to_string()));
+        assert_eq!(half_means(&with_g4(dict, false)), (0, 255));
     }
 }
