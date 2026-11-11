@@ -732,6 +732,14 @@ pub fn parse_color_space(obj: &crate::object::Object) -> Result<ColorSpace> {
         Object::Array(arr) if !arr.is_empty() => {
             if let Some(name) = arr[0].as_name() {
                 match name {
+                    // ISO 32000-1 §8.6.3 writes the device families as bare names,
+                    // but some producers (JUST PDF 3) wrap them in a one-element
+                    // array (`/ColorSpace [/DeviceRGB]`). poppler, pdf.js and MuPDF
+                    // all read that as the bare name; rejecting it dropped every
+                    // image on such pages from both extraction and rendering.
+                    "DeviceRGB" => Ok(ColorSpace::DeviceRGB),
+                    "DeviceGray" => Ok(ColorSpace::DeviceGray),
+                    "DeviceCMYK" => Ok(ColorSpace::DeviceCMYK),
                     "Indexed" => Ok(ColorSpace::Indexed),
                     "CalGray" => Ok(ColorSpace::CalGray),
                     "CalRGB" => Ok(ColorSpace::CalRGB),
@@ -4377,5 +4385,25 @@ mod non_ccitt_1bpc_devicegray_tests {
         assert_eq!(white + black, 24);
         assert_eq!(white, 22, "polarity inverted: majority is now white");
         assert_eq!(black, 2, "the notch is now the black pixels");
+    }
+}
+
+#[cfg(test)]
+mod one_element_device_color_space_tests {
+    use super::*;
+    use crate::object::Object;
+
+    // `/ColorSpace [/DeviceRGB]` (JUST PDF 3) must read as the bare name,
+    // as poppler / pdf.js / MuPDF do, instead of failing the whole image.
+    #[test]
+    fn parse_color_space_accepts_one_element_device_array() {
+        for (name, expected) in [
+            ("DeviceRGB", ColorSpace::DeviceRGB),
+            ("DeviceGray", ColorSpace::DeviceGray),
+            ("DeviceCMYK", ColorSpace::DeviceCMYK),
+        ] {
+            let obj = Object::Array(vec![Object::Name(name.to_string())]);
+            assert_eq!(parse_color_space(&obj).unwrap(), expected, "[/{name}]");
+        }
     }
 }
