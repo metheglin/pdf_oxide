@@ -1269,6 +1269,42 @@ pub fn extract_image_from_xobject_at(
         } else {
             xobject.decode_stream_data()?
         };
+        // An Indexed image's samples are palette indices (ISO 32000-1
+        // §8.6.6.3), and /CCITTFaxDecode codes one-bit samples whatever the
+        // colour space (§7.4.6). The stream filter pipeline leaves a fax
+        // stream coded (the DeviceGray path decodes it lazily through
+        // `ccitt_params`), so the palette lookup below was handed the
+        // still-coded bytes: a Group 4 image fell short of its row count and
+        // was dropped from both extraction and rendering. Decode the fax
+        // stream here, under its own /DecodeParms, before the lookup.
+        //
+        // `decompress_ccitt` answers 1 = black under the default /BlackIs1
+        // false (and the reverse under true), the complement of the filter's
+        // PDF output (§7.4.6 Table 11: black pixels are 0 unless /BlackIs1 is
+        // true). Complementing restores the sample values the palette indexes.
+        let decoded_data = if is_ccitt && bits_per_component == 1 && indexed_resolution.is_some()
+        {
+            let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
+                Object::Reference(_) => doc.and_then(|d| d.resolve_object(o).ok()),
+                other => Some(other.clone()),
+            });
+            match crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(width))
+            {
+                Some(mut params) => {
+                    if params.rows.is_none() {
+                        params.rows = Some(height);
+                    }
+                    let mut samples = ccitt_bilevel::decompress_ccitt(&decoded_data, &params)?;
+                    for b in &mut samples {
+                        *b = !*b;
+                    }
+                    samples
+                },
+                None => decoded_data,
+            }
+        } else {
+            decoded_data
+        };
         if let Some(ir) = indexed_resolution.as_ref() {
             // Build a Transform if the Indexed base has a profile so
             // palette entries render through the real CMM (when linked).
@@ -4445,7 +4481,7 @@ mod one_element_device_color_space_tests {
 }
 
 #[cfg(test)]
-mod stencil_mask_listing_tests {
+mod stencil_and_indexed_fax_tests {
     use super::*;
     use crate::object::Object;
     use std::collections::HashMap;
@@ -4496,6 +4532,15 @@ mod stencil_mask_listing_tests {
             dict,
             data: bytes::Bytes::from(left_black_g4()),
         }
+    }
+
+    fn indexed_gray_two_entries() -> Object {
+        Object::Array(vec![
+            Object::Name("Indexed".to_string()),
+            Object::Name("DeviceGray".to_string()),
+            Object::Integer(1),
+            Object::String(vec![0x00, 0xFF]),
+        ])
     }
 
     /// Mean luma of the left and right halves of the decoded image.
@@ -4573,6 +4618,31 @@ mod stencil_mask_listing_tests {
         };
         assert!(stencil_mask_as_gray_image(&gray).is_none());
         assert!(stencil_mask_as_gray_image(&Object::Null).is_none());
+    }
+
+    #[test]
+    fn a_group4_indexed_gray_image_decodes_left_half_black() {
+        let mut dict = image_dict();
+        dict.insert("ColorSpace".to_string(), indexed_gray_two_entries());
+        assert_eq!(half_means(&with_g4(dict, false)), (0, 255));
+    }
+
+    #[test]
+    fn a_group4_indexed_gray_image_under_black_is_1_swaps_the_halves() {
+        let mut dict = image_dict();
+        dict.insert("ColorSpace".to_string(), indexed_gray_two_entries());
+        assert_eq!(half_means(&with_g4(dict, true)), (255, 0));
+    }
+
+    #[test]
+    fn an_unfiltered_indexed_gray_image_is_unchanged() {
+        let mut dict = image_dict();
+        dict.insert("ColorSpace".to_string(), indexed_gray_two_entries());
+        let raw = Object::Stream {
+            dict,
+            data: bytes::Bytes::from(left_zero_right_one()),
+        };
+        assert_eq!(half_means(&raw), (0, 255));
     }
 
     #[test]
