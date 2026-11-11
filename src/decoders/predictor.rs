@@ -203,7 +203,15 @@ fn decode_png_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
 
     let row_count = data.len() / bytes_per_row;
     let mut output = Vec::with_capacity(row_count * pixel_bytes);
-    let bpp = params.colors; // Bytes per pixel
+    // PNG (and ISO 32000-1 §7.4.4.4, which defers to it) defines the Sub /
+    // Average / Paeth "left" distance as the number of bytes per complete
+    // pixel, ceil(Colors * BitsPerComponent / 8) with a floor of 1 — not the
+    // number of colour components. `params.colors` is only right at 8 bpc;
+    // at 4 bpc with 3 colours (Illustrator CS3 writes `/BitsPerComponent 4`
+    // in /DecodeParms for an 8-bit image and filters 2-byte pixels) the
+    // left neighbour was taken 3 bytes back and every Sub row decoded as
+    // horizontal colour noise. 16 bpc images (6-byte pixels) were off too.
+    let bpp = (params.colors * params.bits_per_component).div_ceil(8).max(1); // Bytes per pixel
 
     for row_idx in 0..row_count {
         let row_start = row_idx * bytes_per_row;
@@ -494,5 +502,41 @@ mod tests {
         // 0xFE (0xFF + 0xFF). The per-row tag=None must suppress that.
         assert_eq!(result.len(), 710);
         assert!(result.iter().all(|&b| b == 0xFF));
+    }
+}
+
+#[cfg(test)]
+mod png_bpp_tests {
+    use super::*;
+
+    // The Sub filter's "left" sample is one whole pixel back:
+    // ceil(Colors * BitsPerComponent / 8) bytes, not `Colors` bytes.
+    #[test]
+    fn png_sub_uses_bytes_per_pixel_for_4bpc_rgb() {
+        // Columns 2, Colors 3, BitsPerComponent 4 -> 3 bytes per row, 2-byte pixels.
+        // Raw samples [0x12, 0x34, 0x56]; Sub-filtered with bpp 2: [0x12, 0x34, 0x56 - 0x12].
+        let params = DecodeParams { predictor: 15, columns: 2, colors: 3, bits_per_component: 4 };
+        let encoded = [1u8, 0x12, 0x34, 0x44];
+        let decoded = decode_predictor(&encoded, &params).unwrap();
+        assert_eq!(decoded, vec![0x12, 0x34, 0x56]);
+    }
+
+    #[test]
+    fn png_sub_uses_bytes_per_pixel_for_16bpc_gray() {
+        // Columns 2, Colors 1, BitsPerComponent 16 -> 4 bytes per row, 2-byte pixels.
+        // Raw samples [1, 2, 3, 4]; Sub-filtered with bpp 2: [1, 2, 3 - 1, 4 - 2].
+        let params = DecodeParams { predictor: 15, columns: 2, colors: 1, bits_per_component: 16 };
+        let encoded = [1u8, 1, 2, 2, 2];
+        let decoded = decode_predictor(&encoded, &params).unwrap();
+        assert_eq!(decoded, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn png_sub_8bpc_rgb_is_unchanged() {
+        // Columns 2, Colors 3, BitsPerComponent 8 -> 6 bytes per row, 3-byte pixels.
+        let params = DecodeParams { predictor: 15, columns: 2, colors: 3, bits_per_component: 8 };
+        let encoded = [1u8, 10, 20, 30, 1, 1, 1];
+        let decoded = decode_predictor(&encoded, &params).unwrap();
+        assert_eq!(decoded, vec![10, 20, 30, 11, 21, 31]);
     }
 }
