@@ -1310,7 +1310,7 @@ impl TextRasterizer {
                     } else {
                         *bytes.get(idx).unwrap_or(&0) as u16
                     };
-                    sum += font_info_ref.get_glyph_width(char_code);
+                    sum += font_info_ref.painted_glyph_width(char_code);
                 }
                 sum
             } else {
@@ -1646,7 +1646,7 @@ impl TextRasterizer {
             // + origin offset (vertical mode). Both lookups read from
             // FontInfo's hot caches; the vertical lookup is only consulted
             // when wmode==1, keeping the horizontal fast path unchanged.
-            let pdf_width = font_info.get_glyph_width(cid);
+            let pdf_width = font_info.painted_glyph_width(cid);
             let x_advance = pdf_width * font_size / 1000.0;
             let (y_step, paint_origin_dx, paint_origin_dy) = if wmode == 1 {
                 let m = font_info.get_vertical_metrics(cid);
@@ -1814,7 +1814,7 @@ impl TextRasterizer {
 
             // PDF advance metrics (font's own /W array) — paint position is
             // independent of the substituted glyph's native advance.
-            let pdf_width = font_info.get_glyph_width(cid);
+            let pdf_width = font_info.painted_glyph_width(cid);
             let x_advance = pdf_width * font_size / 1000.0;
             let (y_step, paint_origin_dx, paint_origin_dy) = if wmode == 1 {
                 let m = font_info.get_vertical_metrics(cid);
@@ -2068,7 +2068,7 @@ fn measure_text_bytes(
             // case Tw is meant to cover.
             let word_space_eligible = nbytes == 1 && code == 0x20;
             if wmode == 0 {
-                let glyph_adv = font.get_glyph_width(char_code) * font_size / 1000.0;
+                let glyph_adv = font.painted_glyph_width(char_code) * font_size / 1000.0;
                 advance += (glyph_adv + gs.char_space) * h_scale;
                 if word_space_eligible {
                     advance += gs.word_space * h_scale;

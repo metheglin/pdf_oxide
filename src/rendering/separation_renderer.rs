@@ -2542,7 +2542,7 @@ fn measure_text_advance(
     if let Some(info) = font_info.as_ref() {
         if info.subtype != "Type0" {
             for &b in text {
-                units += info.get_glyph_width(b as u16);
+                units += info.painted_glyph_width(b as u16);
                 count += 1;
             }
         } else {
@@ -2550,7 +2550,7 @@ fn measure_text_advance(
             let mut i = 0;
             while i + 1 < text.len() {
                 let code = ((text[i] as u16) << 8) | text[i + 1] as u16;
-                units += info.get_glyph_width(code);
+                units += info.painted_glyph_width(code);
                 count += 1;
                 i += 2;
             }

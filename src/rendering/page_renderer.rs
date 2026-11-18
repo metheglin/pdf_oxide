@@ -3692,7 +3692,7 @@ impl PageRenderer {
 
         let mut x_cursor = 0.0f32;
         for &code in text {
-            let glyph_adv = font_info.get_glyph_width(code as u16) * font_size / 1000.0;
+            let glyph_adv = font_info.painted_glyph_width(code as u16) * font_size / 1000.0;
 
             if paint_glyphs {
                 if let Some(name) = font_info.diff_glyph_names.get(&code) {

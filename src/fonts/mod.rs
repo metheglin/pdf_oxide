@@ -32,6 +32,7 @@ pub mod non_text_detection;
 /// faces (Ryumin-Light, GothicBBB-Medium, STSong-Light, …) without embedding
 /// glyph outlines. ISO 32000-2 §9.7.5.2 mandates support for these collections.
 pub mod predefined_cidfont;
+pub(crate) mod predefined_cmap;
 pub mod provenance;
 /// TrueType font CMap parsing for glyph-to-character mapping.
 pub mod truetype_cmap;

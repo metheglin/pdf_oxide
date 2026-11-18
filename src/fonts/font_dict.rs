@@ -2948,6 +2948,52 @@ impl FontInfo {
         }
     }
 
+    /// The bundled predefined CMap this Type 0 font's `/Encoding` names, if
+    /// any (ISO 32000-1 §9.7.5.2, Table 118). `None` for Identity-H/V, for an
+    /// embedded CMap stream and for a name that is not bundled.
+    fn predefined_cmap(&self) -> Option<super::predefined_cmap::PredefinedCMap> {
+        if self.subtype != "Type0" {
+            return None;
+        }
+        match &self.encoding {
+            Encoding::Standard(name) => super::predefined_cmap::lookup(name),
+            _ => None,
+        }
+    }
+
+    /// The width that moves the text position when a glyph is painted, in
+    /// thousandths of an em.
+    ///
+    /// `/W` is keyed by CID (ISO 32000-1 §9.7.4.3). The code is the CID only
+    /// under Identity-H/V; under a predefined CMap such as `UniJIS-UCS2-H` or
+    /// `90ms-RKSJ-H` the CMap gives the CID. [`Self::get_glyph_width`] keys
+    /// `/W` by the code whatever the CMap, so for such a font no entry matched
+    /// and every glyph took `/DW`: a non-embedded MS PGothic or MS Mincho laid
+    /// its digits and Latin letters out at the full-width advance and ran into
+    /// the text that followed.
+    ///
+    /// This is the renderer's lookup. Where the font's CMap is one of the
+    /// bundled predefined CMaps the width is read at the CID that CMap gives
+    /// the code, and a code the CMap does not map takes `/DW`. For every other
+    /// font the answer is [`Self::get_glyph_width`]'s.
+    ///
+    /// Text extraction still calls [`Self::get_glyph_width`]: its line and
+    /// reading-order rules were tuned on those widths, and moving them shifts
+    /// the output of pages that extract correctly today.
+    pub fn painted_glyph_width(&self, char_code: u16) -> f32 {
+        let Some(cmap) = self.predefined_cmap() else {
+            return self.get_glyph_width(char_code);
+        };
+        let declared = cmap
+            .cid(char_code)
+            .and_then(|cid| self.cid_widths.as_ref()?.get(&cid).copied());
+        match declared {
+            Some(width) => width,
+            None if self.has_explicit_dw => self.cid_default_width,
+            None => self.default_width,
+        }
+    }
+
     /// Map a character code to a Unicode string.
     ///
     /// Priority:
@@ -8616,6 +8662,95 @@ mod tests {
         };
         overrides(&mut f);
         f
+    }
+
+    // =========================================================================
+    // The renderer reads /W at the CID a predefined CMap gives the code
+    // (ISO 32000-1 §9.7.4.3, §9.7.5.2); extraction keeps its own lookup.
+    // =========================================================================
+    fn predefined_cmap_font(encoding: &str, widths: &[(u16, f32)]) -> FontInfo {
+        make_font(|f| {
+            f.subtype = "Type0".to_string();
+            f.encoding = Encoding::Standard(encoding.to_string());
+            f.cid_widths = Some(widths.iter().copied().collect());
+            f.cid_default_width = 1000.0;
+            f.has_explicit_dw = true;
+        })
+    }
+
+    #[test]
+    fn a_unicode_cmap_font_paints_at_the_width_of_the_cid() {
+        // UniJIS-UCS2-H: U+0032 is CID 19, U+0041 is CID 34. The `/W` entry at
+        // CID 50 (the numeric value of the code 0x32) belongs to another glyph.
+        let font = predefined_cmap_font("UniJIS-UCS2-H", &[(19, 500.0), (34, 600.0), (50, 777.0)]);
+        assert_eq!(font.painted_glyph_width(0x0032), 500.0);
+        assert_eq!(font.painted_glyph_width(0x0041), 600.0);
+        // U+4E00 is CID 1200, which `/W` does not list: `/DW`.
+        assert_eq!(font.painted_glyph_width(0x4E00), 1000.0);
+    }
+
+    #[test]
+    fn a_shift_jis_cmap_font_paints_at_the_width_of_the_cid() {
+        // 90ms-RKSJ-H sends the single byte 0x41 to the half-width CID 264;
+        // 90msp-RKSJ-H sends it to the proportional CID 34.
+        let widths = [(34, 600.0), (264, 500.0), (843, 900.0)];
+        let ms = predefined_cmap_font("90ms-RKSJ-H", &widths);
+        let msp = predefined_cmap_font("90msp-RKSJ-H", &widths);
+        assert_eq!(ms.painted_glyph_width(0x41), 500.0);
+        assert_eq!(msp.painted_glyph_width(0x41), 600.0);
+        // The two-byte code 0x82A0 (HIRAGANA LETTER A) is CID 843 in both.
+        assert_eq!(ms.painted_glyph_width(0x82A0), 900.0);
+        assert_eq!(msp.painted_glyph_width(0x82A0), 900.0);
+    }
+
+    #[test]
+    fn a_code_the_predefined_cmap_does_not_map_paints_at_the_default_width() {
+        // 0xFFFF has no CID under 90ms-RKSJ-H, so no `/W` entry applies, not
+        // even one whose key happens to equal the code.
+        let font = predefined_cmap_font("90ms-RKSJ-H", &[(0xFFFF, 123.0)]);
+        assert_eq!(font.painted_glyph_width(0xFFFF), 1000.0);
+        // Without an explicit /DW the font's default width stands in, as it
+        // does in `get_glyph_width`.
+        let no_dw = make_font(|f| {
+            f.subtype = "Type0".to_string();
+            f.encoding = Encoding::Standard("90ms-RKSJ-H".to_string());
+            f.cid_widths = Some(HashMap::new());
+            f.default_width = 500.0;
+            f.has_explicit_dw = false;
+        });
+        assert_eq!(no_dw.painted_glyph_width(0x41), 500.0);
+    }
+
+    #[test]
+    fn identity_and_unbundled_cmaps_paint_at_the_width_of_the_code() {
+        let widths = [(0x0032, 500.0)];
+        for encoding in ["Identity-H", "Identity-V", "GBK-EUC-H"] {
+            let font = predefined_cmap_font(encoding, &widths);
+            assert_eq!(font.painted_glyph_width(0x0032), 500.0, "{encoding}");
+            assert_eq!(font.painted_glyph_width(0x0033), font.get_glyph_width(0x0033));
+        }
+        let identity = make_font(|f| {
+            f.subtype = "Type0".to_string();
+            f.encoding = Encoding::Identity;
+            f.cid_widths = Some(widths.iter().copied().collect());
+        });
+        assert_eq!(identity.painted_glyph_width(0x0032), 500.0);
+        // A simple font is untouched.
+        let simple = make_font(|f| {
+            f.widths = Some(vec![400.0, 450.0]);
+            f.first_char = Some(65);
+        });
+        assert_eq!(simple.painted_glyph_width(66), 450.0);
+    }
+
+    #[test]
+    fn extraction_keeps_reading_the_width_at_the_code() {
+        // `get_glyph_width` and `get_space_glyph_width` feed text extraction
+        // and are deliberately left as they were.
+        let font = predefined_cmap_font("UniJIS-UCS2-H", &[(1, 300.0), (19, 500.0), (32, 640.0), (50, 777.0)]);
+        assert_eq!(font.get_glyph_width(0x0032), 777.0);
+        assert_eq!(font.painted_glyph_width(0x0032), 500.0);
+        assert_eq!(font.get_space_glyph_width(), 640.0);
     }
 
     // =========================================================================
