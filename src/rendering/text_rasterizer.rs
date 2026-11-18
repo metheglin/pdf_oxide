@@ -407,6 +407,61 @@ impl GlyphDropTally {
     }
 }
 
+/// An outline builder that keeps nothing: used to ask whether a glyph has an
+/// outline at all (a bitmap-only or empty glyph does not).
+struct DiscardOutline;
+
+impl ttf_parser::OutlineBuilder for DiscardOutline {
+    fn move_to(&mut self, _x: f32, _y: f32) {}
+    fn line_to(&mut self, _x: f32, _y: f32) {}
+    fn quad_to(&mut self, _x1: f32, _y1: f32, _x: f32, _y: f32) {}
+    fn curve_to(&mut self, _x1: f32, _y1: f32, _x2: f32, _y2: f32, _x: f32, _y: f32) {}
+    fn close(&mut self) {}
+}
+
+/// True when the face stored at `index` of `data` maps `ch` to a glyph that
+/// has an outline.
+fn face_has_outline(data: &[u8], index: u32, ch: char) -> bool {
+    ttf_parser::Face::parse(data, index)
+        .ok()
+        .and_then(|face| {
+            let glyph = face.glyph_index(ch)?;
+            face.outline_glyph(glyph, &mut DiscardOutline)
+        })
+        .is_some()
+}
+
+/// The outline of `ch` in a fallback face, with the face's units per em and
+/// the glyph's own horizontal advance in those units.
+fn fallback_outline(face: &CachedFace, ch: char) -> Option<(tiny_skia::Path, f32, Option<u16>)> {
+    let glyph = face.ttf_face.glyph_index(ch)?;
+    let mut builder = PathBuilder::new();
+    face.ttf_face
+        .outline_glyph(glyph, &mut SkiaOutlineBuilder(&mut builder))?;
+    let path = builder.finish()?;
+    Some((path, face.units_per_em, face.ttf_face.glyph_hor_advance(glyph)))
+}
+
+/// How far a glyph painted from a fallback face moves the text position.
+///
+/// The displacement is `w0 * Tfs` with `w0` the width the font dictionary
+/// gives the code (ISO 32000-1 §9.4.4); which face the outline came from does
+/// not enter into it. The fallback face's own advance was used instead, so a
+/// proportional Japanese font (MS PGothic) whose kana are narrower than an em
+/// was laid out at the fallback's full-em advance and ran into the text that
+/// followed. The face's advance is kept only for a font that declares no
+/// widths, where the dictionary's figure is a blanket default.
+fn fallback_glyph_advance(
+    font_declares_widths: bool,
+    pdf_advance: f32,
+    face_advance: Option<f32>,
+) -> f32 {
+    match face_advance {
+        Some(advance) if !font_declares_widths => advance,
+        _ => pdf_advance,
+    }
+}
+
 /// Rasterizer for PDF text operations.
 pub struct TextRasterizer {
     /// Font database for system font fallback.
@@ -426,6 +481,19 @@ pub struct TextRasterizer {
     /// so a broken font would otherwise push one warning per Tj/TJ element
     /// (#991 asked for once per font).
     warned_fonts: std::sync::Mutex<std::collections::HashSet<String>>,
+
+    /// Which face of `fontdb`, if any, supplies a character that neither the
+    /// run's own font nor the CJK fallback has. Kept per rasterizer and not
+    /// in the process-wide face caches, which are keyed by a `fontdb::ID`
+    /// that means something only within one database.
+    glyph_fallback: std::sync::Mutex<GlyphFallbackMemo>,
+}
+
+/// See [`TextRasterizer::face_with_glyph`].
+#[derive(Default)]
+struct GlyphFallbackMemo {
+    by_char: HashMap<char, Option<fontdb::ID>>,
+    faces: HashMap<fontdb::ID, Option<Arc<CachedFace>>>,
 }
 
 impl TextRasterizer {
@@ -434,6 +502,7 @@ impl TextRasterizer {
         Self {
             fontdb: system_fontdb(),
             warned_fonts: Default::default(),
+            glyph_fallback: Default::default(),
         }
     }
 
@@ -445,7 +514,63 @@ impl TextRasterizer {
         Self {
             fontdb,
             warned_fonts: Default::default(),
+            glyph_fallback: Default::default(),
         }
+    }
+
+    /// A face of the font database that has an outline for `ch`.
+    ///
+    /// The last resort for a character that is in neither the font chosen for
+    /// the run nor the CJK fallback. Those two are often one and the same
+    /// face: a non-embedded Japanese font resolves to Droid Sans Fallback on a
+    /// host whose only CJK font it is, and that face has no Latin letters, no
+    /// digits and few symbols, so "CAD" or a black square in Japanese text
+    /// painted nothing although a Latin font sat in the same database.
+    ///
+    /// Upright regular proportional faces are tried first, then by family
+    /// name, so the choice does not depend on the order the fonts were loaded.
+    /// The answer for a character is remembered, found or not.
+    fn face_with_glyph(&self, ch: char) -> Option<Arc<CachedFace>> {
+        // A private-use code point means whatever the font that defines it
+        // says; another font's glyph at that code is a different character.
+        if matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFF) {
+            return None;
+        }
+        let mut memo = self.glyph_fallback.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.font_db();
+        let id = match memo.by_char.get(&ch) {
+            Some(known) => *known,
+            None => {
+                let mut candidates: Vec<&fontdb::FaceInfo> = db.faces().collect();
+                candidates.sort_by_key(|face| {
+                    (
+                        face.style != fontdb::Style::Normal,
+                        face.weight.0.abs_diff(fontdb::Weight::NORMAL.0),
+                        face.monospaced,
+                        face.families.first().map(|(name, _)| name.clone()),
+                        face.index,
+                    )
+                });
+                let found = candidates
+                    .into_iter()
+                    .find(|face| {
+                        db.with_face_data(face.id, |data, index| face_has_outline(data, index, ch))
+                            .unwrap_or(false)
+                    })
+                    .map(|face| face.id);
+                memo.by_char.insert(ch, found);
+                found
+            },
+        }?;
+        memo.faces
+            .entry(id)
+            .or_insert_with(|| {
+                db.with_face_data(id, |data, index| {
+                    CachedFace::new(Arc::new(data.to_vec()), index).map(Arc::new)
+                })
+                .flatten()
+            })
+            .clone()
     }
 
     /// Forget which fonts a glyph-drop warning has named. `PageRenderer`
@@ -1440,61 +1565,52 @@ impl TextRasterizer {
                 }
                 last_fallback_cluster = Some(cluster);
 
-                // Try to find character in fallback CJK fonts.
+                // Try the CJK fallback face, then any other face of the
+                // database that has the character (see `face_with_glyph`).
                 // get_cjk_fallback_cached() hits a process-wide OnceLock after the
                 // first call — no fontdb queries or font clones on subsequent glyphs.
-                if let Some((cjk_id, cjk_arc, cjk_index)) = get_cjk_fallback_cached(self.font_db())
-                {
-                    if let Some(cjk_cached) = cached_face(cjk_id, cjk_arc, cjk_index) {
-                        if let Some(cjk_glyph_id) = cjk_cached.ttf_face.glyph_index(char_at_pos) {
-                            let mut cjk_pb = PathBuilder::new();
-                            let mut cjk_builder = SkiaOutlineBuilder(&mut cjk_pb);
-                            if cjk_cached
-                                .ttf_face
-                                .outline_glyph(cjk_glyph_id, &mut cjk_builder)
-                                .is_some()
-                            {
-                                if let Some(cjk_path) = cjk_pb.finish() {
-                                    let cjk_scale = font_size / cjk_cached.units_per_em;
-                                    let (rise_x, rise_y) = if wmode == 0 {
-                                        (0.0, gs.text_rise)
-                                    } else {
-                                        (gs.text_rise, 0.0)
-                                    };
-                                    let px =
-                                        (x_cursor + x_offset + paint_origin_dx) * h_scale + rise_x;
-                                    let py = y_cursor + y_offset + paint_origin_dy + rise_y;
-                                    // No y reflection here. ISO 32000-1:2008 9.4.4 makes
-                                    // the rendering matrix Tfs/Th/Trise x Tm x CTM the whole
-                                    // glyph-space-to-device transform, and the page's single
-                                    // y-flip already lives in page_base_transform. The primary
-                                    // glyph path above and the CID and substituted-CJK paths
-                                    // all compose this same `combined_base` with a positive
-                                    // scale; this fallback branch was the only place that
-                                    // negated it, so a run routed here came out mirrored.
-                                    let cjk_transform = combined_base
-                                        .pre_translate(px, py)
-                                        .pre_scale(cjk_scale, cjk_scale);
-                                    guarded_fill_path(
-                                        pixmap,
-                                        &cjk_path,
-                                        paint,
-                                        tiny_skia::FillRule::Winding,
-                                        cjk_transform,
-                                        clip_mask,
-                                    );
-                                    has_outline = true;
+                let outline = get_cjk_fallback_cached(self.font_db())
+                    .and_then(|(id, data, index)| cached_face(id, data, index))
+                    .and_then(|face| fallback_outline(&face, char_at_pos))
+                    .or_else(|| {
+                        self.face_with_glyph(char_at_pos)
+                            .and_then(|face| fallback_outline(&face, char_at_pos))
+                    });
+                if let Some((fallback_path, fallback_units_per_em, face_advance)) = outline {
+                    let fallback_scale = font_size / fallback_units_per_em;
+                    let (rise_x, rise_y) = if wmode == 0 {
+                        (0.0, gs.text_rise)
+                    } else {
+                        (gs.text_rise, 0.0)
+                    };
+                    let px = (x_cursor + x_offset + paint_origin_dx) * h_scale + rise_x;
+                    let py = y_cursor + y_offset + paint_origin_dy + rise_y;
+                    // No y reflection here. ISO 32000-1:2008 9.4.4 makes
+                    // the rendering matrix Tfs/Th/Trise x Tm x CTM the whole
+                    // glyph-space-to-device transform, and the page's single
+                    // y-flip already lives in page_base_transform. The primary
+                    // glyph path above and the CID and substituted-CJK paths
+                    // all compose this same `combined_base` with a positive
+                    // scale; this fallback branch was the only place that
+                    // negated it, so a run routed here came out mirrored.
+                    let fallback_transform = combined_base
+                        .pre_translate(px, py)
+                        .pre_scale(fallback_scale, fallback_scale);
+                    guarded_fill_path(
+                        pixmap,
+                        &fallback_path,
+                        paint,
+                        tiny_skia::FillRule::Winding,
+                        fallback_transform,
+                        clip_mask,
+                    );
+                    has_outline = true;
 
-                                    if let Some(adv) =
-                                        cjk_cached.ttf_face.glyph_hor_advance(cjk_glyph_id)
-                                    {
-                                        x_advance_override =
-                                            Some(adv as f32 / cjk_cached.units_per_em * font_size);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    x_advance_override = Some(fallback_glyph_advance(
+                        font_info.is_some_and(|f| f.has_explicit_widths()),
+                        x_advance,
+                        face_advance.map(|adv| adv as f32 / fallback_units_per_em * font_size),
+                    ));
                 }
 
                 if !has_outline {
@@ -1892,7 +2008,39 @@ impl TextRasterizer {
                     }
                 }
             } else if !is_whitespace {
-                glyphs_missing += 1;
+                // Droid Sans Fallback has no Latin letters, no digits and few
+                // symbols, and a Japanese font shows all of them (half-width
+                // CIDs, bullets). Take such a character from another face of
+                // the database before giving it up; the advance stays the
+                // one the font dictionary gives.
+                let other = (ch != '\0')
+                    .then(|| self.face_with_glyph(ch))
+                    .flatten()
+                    .and_then(|face| fallback_outline(&face, ch));
+                if let Some((path, other_units_per_em, _)) = other {
+                    let other_scale = font_size / other_units_per_em;
+                    let (rise_x, rise_y) = if wmode == 0 {
+                        (0.0, gs.text_rise)
+                    } else {
+                        (gs.text_rise, 0.0)
+                    };
+                    let px = (x_cursor + paint_origin_dx) * h_scale + rise_x;
+                    let py = y_cursor + paint_origin_dy + rise_y;
+                    let glyph_transform = combined_base
+                        .pre_translate(px, py)
+                        .pre_scale(other_scale, other_scale);
+                    guarded_fill_path(
+                        pixmap,
+                        &path,
+                        paint,
+                        tiny_skia::FillRule::Winding,
+                        glyph_transform,
+                        clip_mask,
+                    );
+                    glyphs_painted += 1;
+                } else {
+                    glyphs_missing += 1;
+                }
             }
 
             // Per ISO 32000-1:2008 §9.3.3, Tw applies only to the
@@ -2137,6 +2285,82 @@ mod tests {
     /// A font is named once per page, not once per text run (#991) and not
     /// once per process: the latch clears with `reset_page_warnings`, so the
     /// next page names the same broken font again.
+    /// A database holding the given bundled faces and nothing from the host.
+    fn fontdb_of(fonts: &[&'static [u8]]) -> std::sync::Arc<fontdb::Database> {
+        let mut db = fontdb::Database::new();
+        for font in fonts {
+            db.load_font_data(font.to_vec());
+        }
+        std::sync::Arc::new(db)
+    }
+
+    const DROID_SANS_FALLBACK: &[u8] = include_bytes!("../fonts/assets/DroidSansFallbackFull.ttf");
+    const DEJAVU_SANS: &[u8] = include_bytes!("../fonts/assets/DejaVuSans.ttf");
+    const DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../fonts/assets/DejaVuSans-Bold.ttf");
+
+    /// The situation on a host whose only CJK font is Droid Sans Fallback: it
+    /// is both the font chosen for a Japanese run and the CJK fallback, and it
+    /// has no Latin letters. A Latin face in the same database must supply
+    /// them.
+    #[test]
+    fn a_character_the_cjk_face_lacks_is_found_in_another_face() {
+        // The premise: the CJK face has the ideograph and not the letter.
+        assert!(face_has_outline(DROID_SANS_FALLBACK, 0, '示'));
+        assert!(!face_has_outline(DROID_SANS_FALLBACK, 0, 'C'));
+        assert!(!face_has_outline(DROID_SANS_FALLBACK, 0, '■'));
+
+        let rasterizer =
+            TextRasterizer::with_fontdb(fontdb_of(&[DROID_SANS_FALLBACK, DEJAVU_SANS]));
+        for ch in ['C', '0', '■', 'Ⅲ', '①'] {
+            let face = rasterizer
+                .face_with_glyph(ch)
+                .unwrap_or_else(|| panic!("no face found for {ch:?}"));
+            assert!(fallback_outline(&face, ch).is_some(), "{ch:?} has no outline");
+            // It is the Latin face, which has no ideographs.
+            assert!(face.ttf_face.glyph_index('示').is_none(), "{ch:?}");
+        }
+        // An ideograph is found in the CJK face.
+        let face = rasterizer.face_with_glyph('示').expect("CJK face");
+        assert!(face.ttf_face.glyph_index('C').is_none());
+    }
+
+    #[test]
+    fn a_character_no_face_has_is_not_found() {
+        let rasterizer =
+            TextRasterizer::with_fontdb(fontdb_of(&[DROID_SANS_FALLBACK, DEJAVU_SANS]));
+        // CIRCLED NUMBER FOURTEEN is in neither face.
+        assert!(rasterizer.face_with_glyph('\u{246D}').is_none());
+        // Asked again, the remembered answer is the same.
+        assert!(rasterizer.face_with_glyph('\u{246D}').is_none());
+        // A private-use code point is never taken from another font.
+        assert!(rasterizer.face_with_glyph('\u{E000}').is_none());
+        // And an empty database finds nothing.
+        let empty = TextRasterizer::with_fontdb(fontdb_of(&[]));
+        assert!(empty.face_with_glyph('C').is_none());
+    }
+
+    /// The regular face wins over the bold one whichever was loaded first.
+    #[test]
+    fn the_regular_face_is_preferred_whatever_the_load_order() {
+        for fonts in [[DEJAVU_SANS_BOLD, DEJAVU_SANS], [DEJAVU_SANS, DEJAVU_SANS_BOLD]] {
+            let rasterizer = TextRasterizer::with_fontdb(fontdb_of(&fonts));
+            let face = rasterizer.face_with_glyph('C').expect("a face");
+            assert!(!face.ttf_face.is_bold());
+        }
+    }
+
+    #[test]
+    fn a_fallback_glyph_advances_by_the_width_the_font_dictionary_gives() {
+        // The dictionary declares widths: 0.7 em at 10 pt is 7.0, whatever the
+        // fallback face's own advance (a full em) is.
+        assert_eq!(fallback_glyph_advance(true, 7.0, Some(10.0)), 7.0);
+        assert_eq!(fallback_glyph_advance(true, 7.0, None), 7.0);
+        // No declared widths: the dictionary figure is a blanket default, so
+        // the face's advance is the better guess, as before.
+        assert_eq!(fallback_glyph_advance(false, 5.0, Some(10.0)), 10.0);
+        assert_eq!(fallback_glyph_advance(false, 5.0, None), 5.0);
+    }
+
     #[test]
     fn glyph_drop_report_is_once_per_font_per_page() {
         let rasterizer = TextRasterizer::with_fontdb(std::sync::Arc::new(fontdb::Database::new()));
