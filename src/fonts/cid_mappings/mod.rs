@@ -135,6 +135,44 @@ mod tests {
     }
 
     #[test]
+    fn test_adobe_japan1_half_width_latin_and_digits() {
+        // CIDs 231..=325 are the half-width forms of the ASCII range; a
+        // non-embedded Japanese font under Identity-H shows Latin text and
+        // digits with them. They were absent, so the CID was read as a code
+        // point ("C" came out as U+010A).
+        assert_eq!(lookup_adobe_japan1(231), Some(0x2002)); // half-width space: EN SPACE
+        assert_eq!(lookup_adobe_japan1(247), Some(0x30)); // 0
+        assert_eq!(lookup_adobe_japan1(250), Some(0x33)); // 3
+        assert_eq!(lookup_adobe_japan1(266), Some(0x43)); // C
+        assert_eq!(lookup_adobe_japan1(310), Some(0x6F)); // o
+        for cid in 231..=632u16 {
+            assert!(lookup_adobe_japan1(cid).is_some(), "CID {cid} has no mapping");
+        }
+    }
+
+    #[test]
+    fn test_adobe_japan1_ideographs_are_not_radical_forms() {
+        // The table took the first code Adobe lists for a CID, which for these
+        // is a radical form (U+2E80..=U+2FDF) no CJK text font is sure to have.
+        assert_eq!(lookup_adobe_japan1(2260), Some(0x793A)); // 示, was U+2EAC
+        assert_eq!(lookup_adobe_japan1(2664), Some(0x9752)); // 青, was U+2ED8
+        assert_eq!(lookup_adobe_japan1(1200), Some(0x4E00)); // 一, was U+2F00
+        // The few CIDs that really are radical glyphs keep their code.
+        let radicals = (1..=23057u16)
+            .filter(|&cid| matches!(lookup_adobe_japan1(cid), Some(0x2E80..=0x2FDF)))
+            .count();
+        assert_eq!(radicals, 9);
+    }
+
+    #[test]
+    fn test_adobe_japan1_variant_glyph_maps_to_its_base_character() {
+        // CID 230 is the slashed zero: Adobe gives U+0030 U+FE00.
+        assert_eq!(lookup_adobe_japan1(230), Some(0x30));
+        // Entries that were already there are untouched (CID 95 stays "~").
+        assert_eq!(lookup_adobe_japan1(95), Some(0x7E));
+    }
+
+    #[test]
     fn test_adobe_japan1_hiragana() {
         // Test Hiragana from CID
         assert_eq!(lookup_adobe_japan1(843), Some(0x3042)); // CID 843 -> あ
