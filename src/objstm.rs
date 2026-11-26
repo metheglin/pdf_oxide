@@ -89,6 +89,20 @@ pub fn parse_object_stream_with_decryption(
     obj_num: u32,
     gen_num: u32,
 ) -> Result<HashMap<u32, Object>> {
+    Ok(decode_object_stream(stream_obj, decryption_fn, obj_num, gen_num)?.parse_all())
+}
+
+/// Validate and decode an object stream and read its table of members,
+/// without parsing the members themselves.
+///
+/// Arguments and errors are those of [`parse_object_stream_with_decryption`],
+/// which is this followed by [`DecodedObjectStream::parse_all`].
+pub(crate) fn decode_object_stream(
+    stream_obj: &Object,
+    decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
+    obj_num: u32,
+    gen_num: u32,
+) -> Result<DecodedObjectStream> {
     // Extract stream dictionary and data
     let dict = match stream_obj {
         Object::Stream { dict, .. } => dict,
@@ -144,14 +158,48 @@ pub fn parse_object_stream_with_decryption(
     }
 
     // Parse the pairs section (before /First)
-    let pairs_data = &decoded_data[..first];
-    let pairs = parse_object_number_pairs(pairs_data, n)?;
+    let pairs = parse_object_number_pairs(&decoded_data[..first], n)?;
+    let mut last_pair = HashMap::with_capacity(pairs.len());
+    for (position, (member_num, _)) in pairs.iter().enumerate() {
+        last_pair.insert(*member_num, position);
+    }
 
-    // Parse the objects section (after /First)
-    let objects_data = &decoded_data[first..];
-    let mut result = HashMap::new();
+    Ok(DecodedObjectStream {
+        data: decoded_data,
+        first,
+        pairs,
+        last_pair,
+    })
+}
 
-    for (obj_num, offset_in_data) in pairs {
+/// An object stream after decoding, with its table of members, before any
+/// member has been parsed.
+///
+/// Parsing every member of a large stream to answer a request for one of them
+/// is wasteful when the caller cannot keep the parsed members (they may not
+/// fit its cache), so this form lets one member be parsed at a time.
+pub(crate) struct DecodedObjectStream {
+    /// The decoded stream: the pairs section, then the objects section.
+    data: Vec<u8>,
+    /// Offset of the objects section (`/First`).
+    first: usize,
+    /// `(object number, offset in the objects section)`, in stream order.
+    pairs: Vec<(u32, usize)>,
+    /// For each object number, the position in `pairs` of its last entry.
+    last_pair: HashMap<u32, usize>,
+}
+
+impl DecodedObjectStream {
+    /// Size of the decoded stream in bytes.
+    pub(crate) fn decoded_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Parse the member at `position` in the pairs table.
+    fn parse_pair(&self, position: usize) -> Option<Object> {
+        let (obj_num, offset_in_data) = self.pairs[position];
+        let objects_data = &self.data[self.first..];
+
         // The offset is relative to the start of objects_data
         if offset_in_data >= objects_data.len() {
             log::warn!(
@@ -160,15 +208,12 @@ pub fn parse_object_stream_with_decryption(
                 offset_in_data,
                 objects_data.len()
             );
-            continue;
+            return None;
         }
 
         // Parse the object starting at this offset
-        let obj_data = &objects_data[offset_in_data..];
-        match parse_object(obj_data) {
-            Ok((_remaining, obj)) => {
-                result.insert(obj_num, obj);
-            },
+        match parse_object(&objects_data[offset_in_data..]) {
+            Ok((_remaining, obj)) => Some(obj),
             Err(e) => {
                 log::warn!(
                     "Failed to parse object {} from stream at offset {}: {:?}",
@@ -176,13 +221,37 @@ pub fn parse_object_stream_with_decryption(
                     offset_in_data,
                     e
                 );
-                // Continue parsing other objects even if one fails
-                continue;
+                None
             },
         }
     }
 
-    Ok(result)
+    /// Parse every member. A member that fails to parse is skipped; when an
+    /// object number is listed more than once, the last entry that parses wins.
+    pub(crate) fn parse_all(&self) -> HashMap<u32, Object> {
+        let mut result = HashMap::new();
+        for position in 0..self.pairs.len() {
+            if let Some(obj) = self.parse_pair(position) {
+                result.insert(self.pairs[position].0, obj);
+            }
+        }
+        result
+    }
+
+    /// Parse one member, giving the same object [`Self::parse_all`] would hold
+    /// under `obj_num`, or `None` when the stream has no such member.
+    pub(crate) fn parse_member(&self, obj_num: u32) -> Option<Object> {
+        let last = *self.last_pair.get(&obj_num)?;
+        if let Some(obj) = self.parse_pair(last) {
+            return Some(obj);
+        }
+        // The last entry did not parse: fall back to an earlier entry for the
+        // same number, as `parse_all` does by never overwriting with a failure.
+        (0..last)
+            .rev()
+            .filter(|&position| self.pairs[position].0 == obj_num)
+            .find_map(|position| self.parse_pair(position))
+    }
 }
 
 /// Parse the pairs section of an object stream.
@@ -442,5 +511,48 @@ mod tests {
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());
+    }
+
+    /// Stream with members 10, 11, 12, where 11 is listed twice.
+    fn decoded_with_repeated_member(second_eleven: &[u8]) -> DecodedObjectStream {
+        let first_objects = b"42 /Old (twelve) ";
+        let pairs = format!("10 0 11 3 12 8 11 {} ", first_objects.len());
+        let mut combined = pairs.clone().into_bytes();
+        combined.extend_from_slice(first_objects);
+        combined.extend_from_slice(second_eleven);
+
+        let mut dict = HashMap::new();
+        dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
+        dict.insert("N".to_string(), Object::Integer(4));
+        dict.insert("First".to_string(), Object::Integer(pairs.len() as i64));
+        dict.insert("Length".to_string(), Object::Integer(combined.len() as i64));
+        let stream = Object::Stream {
+            dict,
+            data: Bytes::from(combined),
+        };
+        decode_object_stream(&stream, None, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_parse_member_matches_parse_all() {
+        let decoded = decoded_with_repeated_member(b"/New");
+        let all = decoded.parse_all();
+        assert_eq!(all.len(), 3);
+        for obj_num in [10, 11, 12] {
+            assert_eq!(decoded.parse_member(obj_num).as_ref(), all.get(&obj_num));
+        }
+        // The later of the two entries for 11 wins.
+        assert_eq!(decoded.parse_member(11).unwrap().as_name(), Some("New"));
+        assert!(decoded.parse_member(13).is_none());
+    }
+
+    #[test]
+    fn test_parse_member_falls_back_to_earlier_entry() {
+        // The later entry for 11 does not parse, so the earlier one stands,
+        // in both the one-member and the all-members form.
+        let decoded = decoded_with_repeated_member(b")");
+        let all = decoded.parse_all();
+        assert_eq!(all.get(&11).unwrap().as_name(), Some("Old"));
+        assert_eq!(decoded.parse_member(11).as_ref(), all.get(&11));
     }
 }

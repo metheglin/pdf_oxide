@@ -148,6 +148,64 @@ const RUNNING_ARTIFACT_BAND_FRACTION: f32 = 0.12;
 const ARTIFACT_POS_TOL_X: f32 = 40.0;
 const ARTIFACT_POS_TOL_Y: f32 = 24.0;
 
+/// An object stream that decodes to more than this is kept decoded, and its
+/// members are parsed one at a time as they are asked for.
+///
+/// Below it, every member is parsed at once and handed to the object cache, as
+/// before. Above it that stops working: the parsed members of one stream can
+/// exceed the object cache's budget, so they push each other out as they are
+/// inserted and every later lookup decodes and parses the whole stream again.
+const LARGE_OBJSTM_MIN_BYTES: usize = 1024 * 1024;
+
+/// Budget for decoded object streams kept by [`LargeObjStmCache`].
+const LARGE_OBJSTM_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decoded large object streams, oldest first, bounded by decoded size.
+struct LargeObjStmCache {
+    entries: std::collections::VecDeque<(u32, Arc<crate::objstm::DecodedObjectStream>)>,
+    current_bytes: usize,
+}
+
+impl LargeObjStmCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            current_bytes: 0,
+        }
+    }
+
+    fn get(&self, stream_obj_num: u32) -> Option<Arc<crate::objstm::DecodedObjectStream>> {
+        self.entries
+            .iter()
+            .find(|(num, _)| *num == stream_obj_num)
+            .map(|(_, stream)| Arc::clone(stream))
+    }
+
+    /// Keep `stream`, dropping the oldest ones to stay within the budget. A
+    /// stream larger than the whole budget is not kept.
+    fn insert(&mut self, stream_obj_num: u32, stream: Arc<crate::objstm::DecodedObjectStream>) {
+        let size = stream.decoded_len();
+        if size > LARGE_OBJSTM_CACHE_MAX_BYTES || self.get(stream_obj_num).is_some() {
+            return;
+        }
+        while self.current_bytes + size > LARGE_OBJSTM_CACHE_MAX_BYTES {
+            match self.entries.pop_front() {
+                Some((_, old)) => {
+                    self.current_bytes = self.current_bytes.saturating_sub(old.decoded_len())
+                },
+                None => break,
+            }
+        }
+        self.current_bytes += size;
+        self.entries.push_back((stream_obj_num, stream));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.current_bytes = 0;
+    }
+}
+
 // Re-export BoundedEntryCache from cache module for local use and backward compatibility
 pub(crate) use crate::cache::BoundedEntryCache;
 
@@ -401,6 +459,8 @@ pub struct PdfDocument {
     /// Bounded at [`DEFAULT_OBJECT_CACHE_MAX_BYTES`] with FIFO eviction to
     /// prevent unbounded heap growth during multi-page extraction.
     object_cache: Mutex<BoundedObjectCache>,
+    /// Large object streams kept decoded so one member can be parsed at a time.
+    large_objstm_cache: Mutex<LargeObjStmCache>,
     /// Encryption handler (if PDF is encrypted).
     /// Wrapped in RefCell for interior mutability (lazy initialization from &self).
     encryption_handler: Mutex<Option<EncryptionHandler>>,
@@ -1273,6 +1333,7 @@ impl PdfDocument {
             xref,
             trailer,
             object_cache: Mutex::new(BoundedObjectCache::new(DEFAULT_OBJECT_CACHE_MAX_BYTES)),
+            large_objstm_cache: Mutex::new(LargeObjStmCache::new()),
             encryption_handler: Mutex::new(None),
             encrypt_dict_ref: Mutex::new(None),
             options: ParserOptions::default(),
@@ -1661,6 +1722,7 @@ impl PdfDocument {
                 // cache path (it is resolved independently), so clearing
                 // is always safe.
                 self.object_cache.lock_or_recover().clear();
+                self.large_objstm_cache.lock_or_recover().clear();
                 log::debug!(
                     "authenticate(): object cache cleared after successful authentication \
                      to force re-decryption of any pre-auth cached objects"
@@ -3728,13 +3790,19 @@ impl PdfDocument {
         stream_obj_num: u32,
         _index_in_stream: u16,
     ) -> Result<Object> {
-        use crate::objstm::parse_object_stream_with_decryption;
+        use crate::objstm::decode_object_stream;
 
         log::debug!(
             "[load_compressed_debug] Loading obj {} from stream {}",
             obj_ref.id,
             stream_obj_num
         );
+
+        // A large stream decoded earlier: parse the one member asked for.
+        let kept = self.large_objstm_cache.lock_or_recover().get(stream_obj_num);
+        if let Some(stream) = kept {
+            return Ok(self.load_large_objstm_member(obj_ref, stream_obj_num, &stream));
+        }
 
         // Per PDF §7.6.3, object streams (/Type /ObjStm) shall NOT be individually
         // encrypted. Encryption initialization is therefore not required to read an
@@ -3794,28 +3862,34 @@ impl PdfDocument {
         // (non-standard), the unencrypted parse will fail and we fall back to
         // trying with decryption.
         let handler_ref = self.encryption_handler.lock_or_recover();
-        let objects_map = if handler_ref.is_some() {
+        let decoded = if handler_ref.is_some() {
             // First try without decryption (spec-compliant path)
-            match parse_object_stream_with_decryption(&stream_obj, None, 0, 0) {
-                Ok(map) => map,
+            match decode_object_stream(&stream_obj, None, 0, 0) {
+                Ok(decoded) => decoded,
                 Err(_no_decrypt_err) => {
                     // Fallback: try with decryption for non-standard producers
                     let handler = handler_ref.as_ref().unwrap();
                     let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> {
                         handler.decrypt_stream(data, stream_obj_num, 0)
                     };
-                    parse_object_stream_with_decryption(
-                        &stream_obj,
-                        Some(&decrypt_fn),
-                        stream_obj_num,
-                        0,
-                    )?
+                    decode_object_stream(&stream_obj, Some(&decrypt_fn), stream_obj_num, 0)?
                 },
             }
         } else {
-            parse_object_stream_with_decryption(&stream_obj, None, 0, 0)?
+            decode_object_stream(&stream_obj, None, 0, 0)?
         };
         drop(handler_ref);
+
+        // Large stream: keep it decoded and parse only the member asked for,
+        // now and on later lookups (see `LARGE_OBJSTM_MIN_BYTES`).
+        if decoded.decoded_len() > LARGE_OBJSTM_MIN_BYTES {
+            let stream = Arc::new(decoded);
+            self.large_objstm_cache
+                .lock_or_recover()
+                .insert(stream_obj_num, Arc::clone(&stream));
+            return Ok(self.load_large_objstm_member(obj_ref, stream_obj_num, &stream));
+        }
+        let objects_map = decoded.parse_all();
 
         // Extract the requested object
         let obj = match objects_map.get(&obj_ref.id) {
@@ -3859,6 +3933,44 @@ impl PdfDocument {
         }
 
         Ok(obj)
+    }
+
+    /// Parse one member of a large object stream and cache it.
+    ///
+    /// Gives what the parse-everything path gives for the same member: the
+    /// parsed object, or Null when the stream does not hold it, cached only
+    /// when the xref says the object belongs to this stream.
+    fn load_large_objstm_member(
+        &self,
+        obj_ref: ObjectRef,
+        stream_obj_num: u32,
+        stream: &crate::objstm::DecodedObjectStream,
+    ) -> Object {
+        let obj = match stream.parse_member(obj_ref.id) {
+            Some(obj) => obj,
+            None => {
+                // PDF Spec §7.3.10: treat as null
+                log::warn!(
+                    "Object {} not found in object stream {}, treating as Null",
+                    obj_ref.id,
+                    stream_obj_num
+                );
+                return Object::Null;
+            },
+        };
+        let should_cache = match self.xref.get(obj_ref.id) {
+            Some(entry) => {
+                entry.entry_type == crate::xref::XRefEntryType::Compressed
+                    && entry.offset == stream_obj_num as u64
+            },
+            None => true,
+        };
+        if should_cache {
+            self.object_cache
+                .lock_or_recover()
+                .insert(ObjectRef::new(obj_ref.id, 0), obj.clone());
+        }
+        obj
     }
 
     /// Find object header by searching backwards from a given offset.

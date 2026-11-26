@@ -451,6 +451,9 @@ pub trait EditableDocument {
 pub struct DocumentEditor {
     /// Source document (for reading)
     source: PdfDocument,
+    /// The source document's pages in order, read from its page tree once.
+    /// Reset wherever `source` is replaced.
+    source_page_refs: Option<Vec<ObjectRef>>,
     /// Path to the source file
     source_path: String,
     /// Modified objects (object ID -> new object)
@@ -613,6 +616,7 @@ impl DocumentEditor {
 
         Ok(Self {
             source,
+            source_page_refs: None,
             source_path: path_str,
             modified_objects: HashMap::new(),
             new_objects: Vec::new(),
@@ -653,6 +657,7 @@ impl DocumentEditor {
 
         Ok(Self {
             source,
+            source_page_refs: None,
             source_path: String::new(),
             modified_objects: HashMap::new(),
             new_objects: Vec::new(),
@@ -697,6 +702,7 @@ impl DocumentEditor {
 
         Ok(Self {
             source,
+            source_page_refs: None,
             source_path: String::new(),
             modified_objects: HashMap::new(),
             new_objects: Vec::new(),
@@ -798,6 +804,7 @@ impl DocumentEditor {
         }
         let new_bytes = self.save_to_bytes()?;
         self.source = PdfDocument::from_bytes(new_bytes)?;
+        self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
         self.next_object_id = Self::find_max_object_id(&self.source) + 1;
@@ -812,6 +819,7 @@ impl DocumentEditor {
     /// Clears all staged modifications so subsequent fixes operate on the new document.
     pub(crate) fn replace_source_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
         self.source = PdfDocument::from_bytes(bytes)?;
+        self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
         self.next_object_id = Self::find_max_object_id(&self.source) + 1;
@@ -1034,7 +1042,21 @@ impl DocumentEditor {
     }
 
     /// Get the list of page objects in current order.
+    ///
+    /// The source document's page tree does not change while it is the source
+    /// (edits are staged beside it), so it is walked once: the walk loads every
+    /// page dictionary, which is too much to repeat for each page property read.
     fn get_page_refs(&mut self) -> Result<Vec<ObjectRef>> {
+        if let Some(page_refs) = &self.source_page_refs {
+            return Ok(page_refs.clone());
+        }
+        let page_refs = self.read_page_refs()?;
+        self.source_page_refs = Some(page_refs.clone());
+        Ok(page_refs)
+    }
+
+    /// Walk the source document's page tree and list its pages in order.
+    fn read_page_refs(&mut self) -> Result<Vec<ObjectRef>> {
         // Get catalog and pages tree
         let catalog = self.source.catalog()?;
         let catalog_dict = catalog
