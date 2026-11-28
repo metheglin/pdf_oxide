@@ -102,6 +102,14 @@ impl PdfImage {
         }
     }
 
+    /// Bytes of image data held (encoded JPEG bytes, or decoded pixels).
+    pub(crate) fn data_len(&self) -> usize {
+        match &self.data {
+            ImageData::Jpeg(bytes) => bytes.len(),
+            ImageData::Raw { pixels, .. } => pixels.len(),
+        }
+    }
+
     /// Whether the stored samples are still in the image's raw sample space
     /// (see the field docs for what leaves it).
     pub fn samples_are_raw(&self) -> bool {

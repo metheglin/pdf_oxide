@@ -206,6 +206,86 @@ impl LargeObjStmCache {
     }
 }
 
+/// Budget for the decoded image data kept by [`FormImagesCache`].
+const FORM_IMAGES_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Images extracted from Form XObjects, bounded by entry count and by the size
+/// of the image data they hold.
+///
+/// The entries hold decoded pixels, so an entry count alone is no bound: on a
+/// scanned document every page is a form of full-page strips, and a thousand
+/// of them is tens of gigabytes. Eviction is least-recently-used, as in
+/// [`BoundedEntryCache`].
+pub(crate) struct FormImagesCache {
+    map: HashMap<ObjectRef, (Vec<crate::extractors::PdfImage>, usize)>,
+    order: std::collections::VecDeque<ObjectRef>,
+    max_entries: usize,
+    max_bytes: usize,
+    current_bytes: usize,
+}
+
+impl FormImagesCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            max_entries,
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
+    fn images_bytes(images: &[crate::extractors::PdfImage]) -> usize {
+        images
+            .iter()
+            .map(|img| img.data_len() + std::mem::size_of::<crate::extractors::PdfImage>())
+            .sum()
+    }
+
+    fn get(&mut self, key: &ObjectRef) -> Option<&Vec<crate::extractors::PdfImage>> {
+        if self.map.contains_key(key) {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(*key);
+        }
+        self.map.get(key).map(|(images, _)| images)
+    }
+
+    fn remove(&mut self, key: &ObjectRef) {
+        if let Some((_, size)) = self.map.remove(key) {
+            self.current_bytes = self.current_bytes.saturating_sub(size);
+        }
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+    }
+
+    /// Keep a copy of `images`, dropping the least recently used entries to
+    /// stay within both bounds. A list larger than the whole byte budget is
+    /// not kept, and is not copied either.
+    fn insert(&mut self, key: ObjectRef, images: &[crate::extractors::PdfImage]) {
+        self.remove(&key);
+        let size = Self::images_bytes(images);
+        if size > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        while self.map.len() >= self.max_entries || self.current_bytes + size > self.max_bytes {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some((_, old_size)) = self.map.remove(&old) {
+                        self.current_bytes = self.current_bytes.saturating_sub(old_size);
+                    }
+                },
+                None => break,
+            }
+        }
+        self.current_bytes += size;
+        self.map.insert(key, (images.to_vec(), size));
+        self.order.push_back(key);
+    }
+}
+
 // Re-export BoundedEntryCache from cache module for local use and backward compatibility
 pub(crate) use crate::cache::BoundedEntryCache;
 
@@ -582,9 +662,9 @@ pub struct PdfDocument {
         Mutex<BoundedEntryCache<(ObjectRef, [i64; 6]), Option<Vec<crate::layout::TextSpan>>>>,
     /// Cache of extracted images from Form XObjects (keyed by ObjectRef).
     /// Images are stored without CTM applied — caller applies its own CTM.
-    /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
-    pub(crate) form_xobject_images_cache:
-        Mutex<BoundedEntryCache<ObjectRef, Vec<crate::extractors::PdfImage>>>,
+    /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries and
+    /// [`FORM_IMAGES_CACHE_MAX_BYTES`] of image data.
+    pub(crate) form_xobject_images_cache: Mutex<FormImagesCache>,
     /// Regions marked for erasure per page. Mutex for `&self` write-path methods (#398).
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
@@ -1360,8 +1440,9 @@ impl PdfDocument {
             xobject_spans_cache: Mutex::new(BoundedEntryCache::new(
                 DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
             )),
-            form_xobject_images_cache: Mutex::new(BoundedEntryCache::new(
+            form_xobject_images_cache: Mutex::new(FormImagesCache::new(
                 DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
+                FORM_IMAGES_CACHE_MAX_BYTES,
             )),
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
@@ -24715,10 +24796,11 @@ impl PdfDocument {
 
         xobject_stack.pop();
 
-        // Cache the raw images (with Form's own Matrix applied, but no parent CTM)
+        // Cache the raw images (with Form's own Matrix applied, but no parent CTM).
+        // The cache copies them only if they fit its byte budget.
         self.form_xobject_images_cache
             .lock_or_recover()
-            .insert(xobject_ref, raw_images.clone());
+            .insert(xobject_ref, &raw_images);
 
         // Apply parent_ctm to produce final images for this call
         let images = raw_images
@@ -33664,6 +33746,66 @@ mod tests {
         assert!(c.get(&1).is_none(), "First inserted should be evicted");
         assert_eq!(c.get(&2), Some(&"b"));
         assert_eq!(c.get(&3), Some(&"c"));
+    }
+
+    // ====================================================================
+    // FormImagesCache
+    // ====================================================================
+
+    fn form_cache_image(bytes: usize) -> crate::extractors::PdfImage {
+        crate::extractors::PdfImage::new(
+            1,
+            1,
+            crate::extractors::ColorSpace::DeviceGray,
+            8,
+            crate::extractors::ImageData::Raw {
+                pixels: vec![0u8; bytes],
+                format: crate::extractors::PixelFormat::Grayscale,
+            },
+        )
+    }
+
+    #[test]
+    fn test_form_images_cache_evicts_by_bytes() {
+        let mut c = FormImagesCache::new(1024, 10_000);
+        let key = |n: u32| ObjectRef::new(n, 0);
+        c.insert(key(1), &[form_cache_image(4_000)]);
+        c.insert(key(2), &[form_cache_image(4_000)]);
+        assert!(c.get(&key(1)).is_some());
+        assert!(c.get(&key(2)).is_some());
+        // Touch 1, then add a third: 2 is now the least recently used.
+        assert!(c.get(&key(1)).is_some());
+        c.insert(key(3), &[form_cache_image(4_000)]);
+        assert!(c.get(&key(1)).is_some(), "recently used entry survives");
+        assert!(c.get(&key(2)).is_none(), "least recently used entry is evicted");
+        assert!(c.get(&key(3)).is_some());
+        assert!(c.current_bytes <= 10_000);
+    }
+
+    #[test]
+    fn test_form_images_cache_skips_oversized_entry() {
+        let mut c = FormImagesCache::new(1024, 10_000);
+        let key = |n: u32| ObjectRef::new(n, 0);
+        c.insert(key(1), &[form_cache_image(4_000)]);
+        c.insert(key(2), &[form_cache_image(6_000), form_cache_image(6_000)]);
+        assert!(c.get(&key(2)).is_none(), "an entry over the budget is not kept");
+        assert!(c.get(&key(1)).is_some(), "and it evicts nothing");
+        // Replacing an entry with an oversized one drops the old copy.
+        c.insert(key(1), &[form_cache_image(20_000)]);
+        assert!(c.get(&key(1)).is_none());
+        assert_eq!(c.current_bytes, 0);
+    }
+
+    #[test]
+    fn test_form_images_cache_entry_limit() {
+        let mut c = FormImagesCache::new(2, 1_000_000);
+        let key = |n: u32| ObjectRef::new(n, 0);
+        c.insert(key(1), &[]);
+        c.insert(key(2), &[]);
+        c.insert(key(3), &[]);
+        assert!(c.get(&key(1)).is_none());
+        assert!(c.get(&key(2)).is_some());
+        assert!(c.get(&key(3)).is_some());
     }
 
     // ====================================================================
